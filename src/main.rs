@@ -1,6 +1,7 @@
 use chrono::{DateTime, TimeZone, Utc};
 use clap::Parser;
 use ego_tree::NodeRef;
+use rayon::prelude::*;
 use reqwest::blocking::Client;
 use rusqlite::{Connection, Row};
 use scraper::{Html, Node};
@@ -12,6 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use std::{fs, thread};
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{Schema, STORED, TEXT};
+use tantivy::{Document, Index, ReloadPolicy};
 
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
@@ -28,14 +33,16 @@ enum ProgramArguments {
         #[arg(long, default_value_t = 10)]
         parallelism: usize,
         /// Time maximum time to wait for each page to answer
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 15)]
         timeout_seconds: u64,
         /// How many pages to store in each bundle
-        #[arg(long, default_value_t = 1_000)]
+        #[arg(long, default_value_t = 500)]
         bundle_size: usize,
     },
     /// Read the raw pages to extract the readable text and index it for search
     IndexContents,
+    /// Search the indexed content
+    Search { query: String },
 }
 
 #[derive(Deserialize, Serialize)]
@@ -77,6 +84,7 @@ fn main() -> anyhow::Result<()> {
             bundle_size,
         ),
         ProgramArguments::IndexContents => index_contents(),
+        ProgramArguments::Search { query } => search(query),
     }
 }
 
@@ -130,14 +138,23 @@ fn download_pages(parallelism: usize, timeout: Duration, bundle_size: usize) -> 
     fs::create_dir_all("data/raw_pages")?;
 
     // Detect the pages that were already loaded
-    let mut downloaded_urls = HashSet::new();
+    let downloaded_urls = Mutex::new(HashSet::new());
+    let mut raw_page_paths = Vec::new();
     for maybe_entry in fs::read_dir("data/raw_pages")? {
         let entry = maybe_entry?;
-        let downloaded_pages: Vec<DownloadedPage> = read_compressed_json(&entry.path())?;
-        for page in downloaded_pages {
-            downloaded_urls.insert(page.url);
-        }
+        raw_page_paths.push(entry.path());
     }
+    raw_page_paths
+        .into_par_iter()
+        .try_for_each(|path| -> anyhow::Result<()> {
+            let downloaded_pages: Vec<DownloadedPage> = read_compressed_json(&path)?;
+            let mut downloaded_urls = downloaded_urls.lock().unwrap();
+            for page in downloaded_pages {
+                downloaded_urls.insert(page.url);
+            }
+            Ok(())
+        })?;
+    let downloaded_urls = downloaded_urls.into_inner().unwrap();
     println!(
         "Detected that {} URLs were already downloaded",
         downloaded_urls.len()
@@ -273,22 +290,41 @@ fn read_compressed_json<T: DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
 }
 
 fn index_contents() -> anyhow::Result<()> {
-    let mut all_text = Vec::new();
+    let index_path = "data/tantivy-index";
+    fs::create_dir_all(index_path)?;
+
+    let mut schema_builder = Schema::builder();
+    schema_builder.add_text_field("url", TEXT | STORED);
+    schema_builder.add_text_field("content", TEXT);
+    let schema = schema_builder.build();
+
+    let index = Index::create_in_dir(index_path, schema.clone())?;
+    let mut index_writer = index.writer(50_000_000)?;
+    let url_field = schema.get_field("url").unwrap();
+    let content_field = schema.get_field("content").unwrap();
 
     for maybe_entry in fs::read_dir("data/raw_pages")? {
-        let entry = maybe_entry?;
-        println!("Will index data from {}", entry.path().display());
-        let downloaded_pages: Vec<DownloadedPage> = read_compressed_json(&entry.path())?;
+        let entry_path = maybe_entry?.path();
+        let downloaded_pages: Vec<DownloadedPage> = read_compressed_json(&entry_path)?;
+        println!(
+            "Read {} pages from {}",
+            downloaded_pages.len(),
+            entry_path.display()
+        );
+
         for page in downloaded_pages {
             if let DownloadedPageContent::Html(html_source) = page.content {
                 let readable_text = extract_readable_text(&html_source);
-                all_text.push(readable_text);
+
+                let mut document = Document::default();
+                document.add_text(url_field, page.url);
+                document.add_text(content_field, readable_text);
+                index_writer.add_document(document)?;
             }
         }
     }
 
-    println!("Will write all_text");
-    write_compressed_json(Path::new("data/all_text"), &all_text)?;
+    index_writer.commit()?;
 
     Ok(())
 }
@@ -316,4 +352,32 @@ fn extract_readable_text(html_source: &str) -> String {
     recurse_page_tree(&mut readable_text, &document.root_element());
 
     readable_text
+}
+
+fn search(query: String) -> anyhow::Result<()> {
+    let index_path = "data/tantivy-index";
+    fs::create_dir_all(index_path)?;
+
+    let mut schema_builder = Schema::builder();
+    schema_builder.add_text_field("url", TEXT | STORED);
+    schema_builder.add_text_field("content", TEXT);
+    let schema = schema_builder.build();
+    let url_field = schema.get_field("url").unwrap();
+    let content_field = schema.get_field("content").unwrap();
+
+    let index = Index::open_in_dir(index_path)?;
+
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::OnCommit)
+        .try_into()?;
+    let searcher = reader.searcher();
+    let query_parser = QueryParser::for_index(&index, vec![url_field, content_field]);
+    let query = query_parser.parse_query(&query)?;
+    let top_docs = searcher.search(&query, &TopDocs::with_limit(10))?;
+    for (_score, doc_address) in top_docs {
+        let retrieved_doc = searcher.doc(doc_address)?;
+        println!("{}", schema.to_json(&retrieved_doc));
+    }
+    Ok(())
 }
